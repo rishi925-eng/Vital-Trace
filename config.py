@@ -42,6 +42,19 @@ class Config:
     # Monitoring
     SENTRY_DSN = os.environ.get('SENTRY_DSN')
     METRICS_ENABLED = os.environ.get('METRICS_ENABLED', 'false').lower() == 'true'
+    
+    # Security
+    SESSION_COOKIE_SECURE = True
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = 'Lax'
+
+class TestingConfig(Config):
+    """Testing configuration"""
+    TESTING = True
+    SQLALCHEMY_DATABASE_URI = os.environ.get('TEST_DATABASE_URL') or \
+        'sqlite:///test_iot_data.db'
+    WTF_CSRF_ENABLED = False
+    pass
 
 class DevelopmentConfig(Config):
     """Development configuration"""
@@ -57,12 +70,6 @@ class ProductionConfig(Config):
     SESSION_COOKIE_SECURE = True
     SESSION_COOKIE_HTTPONLY = True
     SESSION_COOKIE_SAMESITE = 'Lax'
-
-class TestingConfig(Config):
-    """Testing configuration"""
-    TESTING = True
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:'
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(seconds=1)
 
 config = {
     'development': DevelopmentConfig,

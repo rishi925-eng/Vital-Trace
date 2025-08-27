@@ -600,6 +600,13 @@ class SensorData(db.Model):
             'timestamp': self.timestamp.isoformat() if self.timestamp else None
         }
 
+from datetime import datetime, timezone
+import uuid
+import json
+from typing import Dict, Any, Optional
+
+# ... existing code from models.py (User, Device, SensorData classes)
+
 class Alert(db.Model):
     """Alert model"""
     __tablename__ = 'alerts'
@@ -609,8 +616,8 @@ class Alert(db.Model):
     alert_type = db.Column(db.String(50), nullable=False)
     title = db.Column(db.String(200), nullable=False)
     message = db.Column(db.Text, nullable=False)
-    severity = db.Column(db.String(20), default='medium')
-    status = db.Column(db.String(20), default='active')
+    severity = db.Column(db.String(20), default='medium') # medium, high, critical
+    status = db.Column(db.String(20), default='active') # active, acknowledged, resolved
     assigned_user_id = db.Column(db.String(36), db.ForeignKey('users.id'))
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     acknowledged_at = db.Column(db.DateTime)
@@ -618,20 +625,19 @@ class Alert(db.Model):
     metadata = db.Column(db.Text)
     
     def set_metadata(self, data: Dict[str, Any]) -> None:
-        """Set metadata as JSON string"""
         self.metadata = json.dumps(data) if data else None
     
     def get_metadata(self) -> Optional[Dict[str, Any]]:
-        """Get metadata as dictionary"""
         return json.loads(self.metadata) if self.metadata else None
     
     def acknowledge(self, user_id: str = None) -> None:
         """Mark the alert as acknowledged"""
-        self.status = 'acknowledged'
-        if user_id:
-            self.assigned_user_id = user_id
-        self.acknowledged_at = datetime.now(timezone.utc)
-        db.session.commit()
+        if self.status == 'active':
+            self.status = 'acknowledged'
+            self.acknowledged_at = datetime.now(timezone.utc)
+            if user_id:
+                self.assigned_user_id = user_id
+            db.session.commit()
     
     def resolve(self) -> None:
         """Mark the alert as resolved"""
@@ -640,7 +646,6 @@ class Alert(db.Model):
         db.session.commit()
     
     def to_dict(self):
-        """Convert to dictionary"""
         return {
             'id': self.id,
             'device_id': self.device_id,
@@ -655,6 +660,8 @@ class Alert(db.Model):
             'resolved_at': self.resolved_at.isoformat() if self.resolved_at else None,
             'metadata': self.get_metadata()
         }
+
+# ... other models if any
 
 class SensorData(db.Model):
     """Sensor data model"""

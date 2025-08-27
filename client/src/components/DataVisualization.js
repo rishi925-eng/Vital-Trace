@@ -37,8 +37,9 @@ const DataVisualization = ({ selectedDevice, socket }) => {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    if (selectedDevice && socket) {
+    if (selectedDevice) {
       setLoading(true);
+      setHistoricalData([]); // Clear previous data
       
       // Fetch historical data
       fetch(`http://localhost:5000/api/data/${selectedDevice}?limit=50`)
@@ -52,7 +53,7 @@ const DataVisualization = ({ selectedDevice, socket }) => {
               minute: '2-digit',
               second: '2-digit'
             })
-          }));
+          })).reverse(); // Reverse to show oldest first
           setHistoricalData(processedData);
           setLoading(false);
         })
@@ -61,7 +62,40 @@ const DataVisualization = ({ selectedDevice, socket }) => {
           setLoading(false);
         });
     }
-  }, [selectedDevice, socket]);
+  }, [selectedDevice]);
+
+  useEffect(() => {
+    if (socket && selectedDevice) {
+      const handleDeviceData = (data) => {
+        if (data.deviceId === selectedDevice) {
+          const newDataPoint = {
+            ...data,
+            time: new Date(data.timestamp).toLocaleTimeString('en-US', {
+              hour12: false,
+              hour: '2-digit',
+              minute: '2-digit',
+              second: '2-digit'
+            })
+          };
+
+          setHistoricalData(prevData => {
+            const updatedData = [...prevData, newDataPoint];
+            // Keep the data array size limited to the last 50 points for performance
+            if (updatedData.length > 50) {
+              return updatedData.slice(updatedData.length - 50);
+            }
+            return updatedData;
+          });
+        }
+      };
+
+      socket.on('device-data', handleDeviceData);
+
+      return () => {
+        socket.off('device-data', handleDeviceData);
+      };
+    }
+  }, [socket, selectedDevice]);
 
   const handleChartTypeChange = (event, newChartType) => {
     if (newChartType !== null) {

@@ -1,232 +1,109 @@
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
-const moment = require('moment');
-const path = require('path');
+const connectDB = require('./config/db');
+const dataRoutes = require('./routes/dataRoutes');
 
+// Initialize app
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server, {
+
+// Connect to MongoDB
+connectDB();
+
+// CORS configuration for Socket.IO
+const io = new Server(server, {
   cors: {
-    origin: "http://localhost:3000",
+    origin: "http://localhost:3000", // Allow React client
     methods: ["GET", "POST"]
   }
 });
 
 // Middleware
-app.use(cors());
+app.use(cors({ origin: 'http://localhost:3000' }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '../client/build')));
 
-// Initialize SQLite Database
-const db = new sqlite3.Database('iot_data.db');
+// API Routes
+app.use('/api/data', dataRoutes);
 
-// Create tables if they don't exist
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS sensor_data (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    device_id TEXT,
-    timestamp TEXT,
-    temperature REAL,
-    humidity REAL,
-    pressure REAL,
-    light REAL,
-    motion BOOLEAN,
-    voltage REAL
-  )`);
-  
-  db.run(`CREATE TABLE IF NOT EXISTS device_commands (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    device_id TEXT,
-    command TEXT,
-    value TEXT,
-    timestamp TEXT,
-    status TEXT DEFAULT 'pending'
-  )`);
-});
+// In-memory store for connected devices. In production, use Redis or a similar store.
+let connectedDevices = [];
 
-// Store connected devices
-const connectedDevices = new Map();
-const connectedClients = new Map();
+// Function to broadcast the updated device list to all frontend clients
+const broadcastDeviceList = () => {
+  const deviceList = connectedDevices.map(d => ({
+    device_id: d.deviceId,
+    name: d.name,
+  }));
+  io.to('frontend_clients').emit('device-list-update', deviceList);
+  console.log('Broadcasted device list to frontend clients:', deviceList);
+};
 
-// WebSocket handling
+// WebSocket connection handling
 io.on('connection', (socket) => {
-  console.log('Client connected:', socket.id);
-  connectedClients.set(socket.id, socket);
+  console.log(`New client connected: ${socket.id}`);
 
-  // Handle device registration
-  socket.on('device_register', (data) => {
-    console.log('Device registered:', data);
-    connectedDevices.set(data.device_id, {
-      socket: socket,
-      info: data,
-      lastSeen: new Date()
-    });
-    
-    // Broadcast device list to all clients
-    io.emit('devices_updated', Array.from(connectedDevices.keys()).map(id => ({
-      device_id: id,
-      ...connectedDevices.get(id).info,
-      status: 'online'
-    })));
-  });
+  // A flag to determine if the client is a device or a frontend app
+  let isDevice = false;
 
-  // Handle sensor data from devices
-  socket.on('sensor_data', (data) => {
-    console.log('Received sensor data:', data);
-    
-    // Store in database
-    const stmt = db.prepare(`INSERT INTO sensor_data 
-      (device_id, timestamp, temperature, humidity, pressure, light, motion, voltage) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`);
-    
-    stmt.run(
-      data.device_id,
-      moment().toISOString(),
-      data.temperature || null,
-      data.humidity || null,
-      data.pressure || null,
-      data.light || null,
-      data.motion || null,
-      data.voltage || null
-    );
-    
-    stmt.finalize();
+  // Initially, all clients join the frontend room. Devices will be moved later.
+  socket.join('frontend_clients');
+  
+  // Send the current device list to the newly connected frontend client
+  socket.emit('device-list-update', connectedDevices.map(d => ({ device_id: d.deviceId, name: d.name })));
 
-    // Update device last seen
-    if (connectedDevices.has(data.device_id)) {
-      connectedDevices.get(data.device_id).lastSeen = new Date();
-    }
+  // Listen for device registration from simulators/hardware
+  socket.on('register-device', (deviceInfo) => {
+    isDevice = true;
+    socket.leave('frontend_clients'); // Device should not receive frontend broadcasts
+    socket.join(deviceInfo.deviceId); // Device joins a room named after its ID to receive commands
+    console.log(`Device registered: ${deviceInfo.deviceId} (${deviceInfo.name}) with socket ${socket.id}`);
 
-    // Broadcast to all connected clients
-    io.emit('real_time_data', data);
-  });
-
-  // Handle commands from dashboard to devices
-  socket.on('device_command', (data) => {
-    console.log('Command received:', data);
-    
-    // Store command in database
-    const stmt = db.prepare(`INSERT INTO device_commands 
-      (device_id, command, value, timestamp) 
-      VALUES (?, ?, ?, ?)`);
-    
-    stmt.run(
-      data.device_id,
-      data.command,
-      data.value,
-      moment().toISOString()
-    );
-    
-    stmt.finalize();
-
-    // Send to specific device
-    const device = connectedDevices.get(data.device_id);
-    if (device) {
-      device.socket.emit('command', {
-        command: data.command,
-        value: data.value,
-        timestamp: moment().toISOString()
+    // Add or update the device in our list
+    const existingDeviceIndex = connectedDevices.findIndex(d => d.deviceId === deviceInfo.deviceId);
+    if (existingDeviceIndex !== -1) {
+      connectedDevices[existingDeviceIndex].socketId = socket.id;
+    } else {
+      connectedDevices.push({
+        deviceId: deviceInfo.deviceId,
+        name: deviceInfo.name,
+        socketId: socket.id
       });
     }
+    // Announce the new/updated device list to all frontend clients
+    broadcastDeviceList();
   });
 
-  // Handle disconnect
+  // Listen for data from devices and forward it to all frontend clients
+  socket.on('device-data', (data) => {
+    // We only process data from registered devices
+    if (isDevice && data.deviceId) {
+      io.to('frontend_clients').emit('device-data', data);
+    }
+  });
+
+  // Listen for commands from the frontend and forward to the specific device
+  socket.on('device-command', ({ deviceId, command, value }) => {
+    console.log(`Command received for ${deviceId}: ${command}=${value}. Sending to room ${deviceId}`);
+    // Send command to the specific device's room
+    io.to(deviceId).emit('command', { command, value });
+  });
+
+  // Handle disconnection for both devices and frontend clients
   socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-    
-    // Remove from devices if it was a device
-    for (const [deviceId, device] of connectedDevices.entries()) {
-      if (device.socket.id === socket.id) {
-        connectedDevices.delete(deviceId);
-        // Update device list
-        io.emit('devices_updated', Array.from(connectedDevices.keys()).map(id => ({
-          device_id: id,
-          ...connectedDevices.get(id).info,
-          status: 'online'
-        })));
-        break;
-      }
+    console.log(`Client disconnected: ${socket.id}`);
+    // If the disconnected client was a device, remove it from the list
+    const disconnectedDeviceIndex = connectedDevices.findIndex(d => d.socketId === socket.id);
+    if (disconnectedDeviceIndex !== -1) {
+      const deviceId = connectedDevices[disconnectedDeviceIndex].deviceId;
+      console.log(`Device ${deviceId} disconnected.`);
+      connectedDevices.splice(disconnectedDeviceIndex, 1);
+      // Announce the updated device list
+      broadcastDeviceList();
     }
-    
-    connectedClients.delete(socket.id);
   });
 });
 
-// REST API endpoints
-app.get('/api/devices', (req, res) => {
-  const devices = Array.from(connectedDevices.keys()).map(id => ({
-    device_id: id,
-    ...connectedDevices.get(id).info,
-    status: 'online',
-    lastSeen: connectedDevices.get(id).lastSeen
-  }));
-  res.json(devices);
-});
-
-app.get('/api/data/:deviceId', (req, res) => {
-  const deviceId = req.params.deviceId;
-  const limit = req.query.limit || 100;
-  
-  db.all(
-    `SELECT * FROM sensor_data WHERE device_id = ? ORDER BY timestamp DESC LIMIT ?`,
-    [deviceId, limit],
-    (err, rows) => {
-      if (err) {
-        res.status(500).json({ error: err.message });
-        return;
-      }
-      res.json(rows.reverse());
-    }
-  );
-});
-
-app.get('/api/data/:deviceId/range', (req, res) => {
-  const deviceId = req.params.deviceId;
-  const start = req.query.start;
-  const end = req.query.end;
-  
-  db.all(
-    `SELECT * FROM sensor_data 
-     WHERE device_id = ? AND timestamp BETWEEN ? AND ? 
-     ORDER BY timestamp ASC`,
-    [deviceId, start, end],
-    (err, rows) => {
-      if (err) {
-        res.status(500).json({ error: err.message });
-        return;
-      }
-      res.json(rows);
-    }
-  );
-});
-
-app.post('/api/command', (req, res) => {
-  const { device_id, command, value } = req.body;
-  
-  io.emit('device_command', { device_id, command, value });
-  
-  res.json({ success: true, message: 'Command sent' });
-});
-
-// Serve React app for all other routes
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../client/build', 'index.html'));
-});
-
-// Start server
-const PORT = process.env.PORT || 5001;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log(`Dashboard available at http://localhost:${PORT}`);
-});
-
-// Cleanup on exit
-process.on('SIGINT', () => {
-  console.log('Shutting down server...');
-  db.close();
-  server.close();
-  process.exit(0);
-});
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
